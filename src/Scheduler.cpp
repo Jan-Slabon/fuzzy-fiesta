@@ -6,11 +6,12 @@
 #include <cstring>
 #include <condition_variable>
 #include <memory>
-
-constexpr size_t buffer_size = 1024; // No message can be larger than buffer_size bytes
+#include <chrono>
+# include <unistd.h>
+constexpr size_t buffer_size = 125; // Amount of messages stored in dispatcher buffer
 constexpr size_t queue_count = 2; // Amount of queues used
 constexpr size_t core_num = 4; // Amount of cores avaliable for application deployment
-constexpr size_t message_size = buffer_size - 4; // buffer_size - sizeof(TAG)
+constexpr size_t message_size = 126; // max size of message payload
 
 using queue_id = uint16_t;
 
@@ -47,12 +48,12 @@ class Queues
             event_queues.push_back({});
        }
     }
-    void emplace(queue_id id, Event event)
+    void emplace(queue_id id, Event& event)
     {
         auto& synchro_context = queues_locks[id];
         std::unique_lock<std::mutex> queue_lock(synchro_context.first);
         synchro_context.second.wait(queue_lock, [&]{return true;});
-        event_queues[id].emplace_back(event);
+        event_queues[id].emplace_back(std::move(event));
 
         queue_lock.unlock();
         synchro_context.second.notify_all();
@@ -74,9 +75,18 @@ class Queues
     {
         return event_queues[id].size() == 0;
     }
+    bool is_empty()
+    {
+        bool empty = true;
+        for(int i=0; i<queue_count; i++)
+        {
+            empty &= is_empty(i);
+        }
+        return empty;
+    }
     private:
     std::vector<std::deque<Event>> event_queues;
-    std::array< std::pair<std::mutex, std::condition_variable>, queue_count> queues_locks{};
+    std::array<std::pair<std::mutex, std::condition_variable>, queue_count> queues_locks{};
 };
 Queues queues{};
 
@@ -102,7 +112,7 @@ class Send_Asset
 class Process
 {
     public: 
-    virtual void operator()(Event) = 0;
+    virtual void operator()(Event&) = 0;
     virtual ~Process(){}
 };
 
@@ -114,53 +124,99 @@ class Dispatcher
     {
         ((void) Scheduled_Processes.push_back(std::make_unique<T>(std::forward<T>(Processes))), ...);
     }
-
-    void run()
+    bool is_buffer_full()
     {
-        char copied_buffer[buffer_size];
-        Event tmp_msg;
+        if(read_write_dirs_reversed == false)
+        {
+            return  false;
+        }
+        else
+        {
+            return  buffer_write_index == buffer_read_index;
+        }
+    }
+    bool is_buffer_empty()
+    {
+        if(read_write_dirs_reversed == false)
+        {
+            return  buffer_read_index == buffer_write_index;;
+        }
+        else
+        {
+            return  false;
+        } 
+    }
+    void run(uint16_t cpu_id)
+    {
+        pthread_t my_thread_native = thread->native_handle();
+        cpu_set_t cpuset_1;
+        CPU_ZERO(&cpuset_1);
+        CPU_SET(cpu_id, &cpuset_1);
+        auto s1 = pthread_setaffinity_np(my_thread_native, sizeof(cpu_set_t), &cpuset_1);
+        if (s1 != 0) printf("Error during setting cpu affinity\n");
+        Event saved_msg;
+        unsigned int saved_proc_id;
         while(true)
         {
             std::unique_lock<std::mutex> buffer_lock{buffer_guard};
-            buffer_sync.wait(buffer_lock, [&](){return message_in_the_buffer;});
-            printf("Event in the buffer taken\n");
+            buffer_sync.wait(buffer_lock, [&](){return message_in_buffer || should_abort;});
+            if(should_abort) break;
 
-            tmp_msg = buffered_msg;
-            message_in_the_buffer = false;
-
+            saved_msg = buffered_message;
+            saved_proc_id = stored_proc_id;
             buffer_lock.unlock();
             buffer_sync.notify_all();
 
-            printf("Sending Event to aproperiate Process = %d\n", proc_index);
-            Scheduled_Processes[proc_index]->operator()(tmp_msg);
+            //printf("Sending Event to aproperiate Process = %d\n", ctx.second);
+            Scheduled_Processes[saved_proc_id]->operator()(buffered_message);
         }
+        //printf("Exiting Dispatcher\n");
     }
-    void spawn()
+    void spawn(uint16_t cpu_id)
     {
-        std::thread(&Dispatcher::run, this).detach();
+        thread = std::make_unique<std::thread>(&Dispatcher::run, this, cpu_id);
     }
-
+    void join()
+    {
+        thread->join();
+    }
+    void abort()
+    {
+        std::unique_lock<std::mutex> abort_lock{abort_guard};
+        should_abort = true;
+        buffer_sync.notify_all();
+    }
     void receive(const Event& event, unsigned int proc_id)
     {
         std::unique_lock<std::mutex> buffer_lock{buffer_guard};
-        buffer_sync.wait(buffer_lock, [&](){return !message_in_the_buffer;});
+        buffer_sync.wait(buffer_lock, [&](){return !message_in_buffer;});
 
-        message_in_the_buffer = true;
-
-        proc_index = proc_id;
-        buffered_msg = event;
+        stored_proc_id = proc_id;
+        buffered_message = std::move(event);
 
         buffer_lock.unlock();
         buffer_sync.notify_all();
     }
 
     private:
+    bool will_abort()
+    {
+        std::unique_lock<std::mutex> abort_lock{abort_guard};
+        return should_abort;
+    }
     std::vector<std::unique_ptr<Process>> Scheduled_Processes;
-    Event buffered_msg{};
-    bool message_in_the_buffer{false};
-    unsigned int proc_index;
+    Event buffered_message;
+    bool message_in_buffer{false};
+    unsigned int stored_proc_id;
+    std::array<std::pair<Event, unsigned int>, buffer_size> message_buffer{};
+    uint32_t buffer_read_index{0}; 
+    uint32_t buffer_write_index{0};
+    bool read_write_dirs_reversed{false};
     std::condition_variable buffer_sync{};
     std::mutex buffer_guard{};
+    std::unique_ptr<std::thread> thread;
+    std::mutex abort_guard;
+    bool should_abort{false};
 };
 
 template<typename Proc>
@@ -181,24 +237,26 @@ class Scheduler
         }
         for(int i = 0; i < core_num; i++)
         {
-            dispatchers[i]->spawn();
+            dispatchers[i]->spawn(i);
         }
     }
 
     void run()
     {
-        while (true)
+        while (!queues.is_empty())
         {
-            if(!queues.is_empty(queue_counter))
-            {
-                Event event = queues.get(queue_counter);
-                dispatchers[dispatcher_count]->receive(event, queue_counter);
-                printf("Event send to dispatcher = %d\n", dispatcher_count);
-                dispatcher_count = (dispatcher_count + 1) % core_num;
-            }
+            Event event = queues.get(queue_counter);
+            dispatchers[dispatcher_count]->receive(event, queue_counter);
+            //printf("Event send to dispatcher = %d\n", dispatcher_count);
+            dispatcher_count = (dispatcher_count + 1) % core_num;
             queue_counter = (queue_counter + 1) % queue_count;
         }
-        
+        //printf("All events handled\n");
+        for(auto& dispatcher : dispatchers)
+        {
+            dispatcher->abort();
+            dispatcher->join();
+        }
     }
     private:
     std::vector<std::unique_ptr<Dispatcher>> dispatchers;
@@ -210,15 +268,16 @@ class Scheduler
 class Getter : public Process
 {
     public:
-    void operator() (Event event) override
+    void operator() (Event& event) override
     {
-        printf("Getter Process starts working\n");
+        //printf("Getter Process starts working\n");
         switch(event.event_type)
         {
             case TAG::GET:
             {
                 Get_Asset* msg_body = unwrap<Get_Asset>(event);
-                printf("Processing Get_Req in Getter\n");
+                //usleep(10);
+                //printf("Processing Get_Req in Getter\n");
                 break;
             }
             default:
@@ -231,15 +290,16 @@ class Getter : public Process
 class Sender : public Process
 {
     public:
-    void operator() (Event event) override
+    void operator() (Event& event) override
     {
-        printf("Sender Process starts working\n");
+        //printf("Sender Process starts working\n");
         switch(event.event_type)
         {
             case TAG::SEND:
             {
                 Send_Asset* msg_body = unwrap<Send_Asset>(event);
-                printf("Processing Send_Req in Sender\n");
+                //usleep(10);
+                //printf("Processing Send_Req in Sender\n");
                 break;
             }
             default:
@@ -248,12 +308,29 @@ class Sender : public Process
         }
     }
 };
+void handle_sequential()
+{
+    int queue_counter = 0;
+    Getter get_process{};
+    Sender send_process{};
+    while(!queues.is_empty())
+    {
+        auto msg = queues.get(queue_counter);
+        if(queue_counter == 0)
+        {
+            get_process(msg);
+        }
+        else
+        {
+            send_process(msg);
+        }
 
+        queue_counter = (queue_counter + 1) % queue_count;
+    }
+}
 int main()
 {
-    Scheduler sch(Getter{}, Sender{});
-    std::thread sched_td(&Scheduler::run, std::move(sch));
-    for(int i = 0; i < 100; i++)
+    for(int i = 0; i < 1000000; i++)
     {
         if(i%2 == 0)
         {
@@ -268,7 +345,41 @@ int main()
             queues.emplace(1, event);
         }
     }
+    printf("Queues loaded\n");
+    Scheduler sch(Getter{}, Sender{});
+    std::thread sched_td(&Scheduler::run, std::move(sch));
+    auto start = std::chrono::high_resolution_clock::now();
     printf("Scheduler started succesfully\n");
     sched_td.join();
+    auto stop = std::chrono::high_resolution_clock::now();
+    printf("Elapsed time = %lu microseconds for async\n", std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count());
+    for(int i = 0; i < 1000000; i++)
+    {
+        if(i%2 == 0)
+        {
+            auto msg_payload = Get_Asset("Some Asset");
+            auto event = Event(TAG::GET, (char*)&msg_payload, sizeof(msg_payload));
+            queues.emplace(0, event);
+        }
+        else
+        {
+            auto msg_payload = Send_Asset("Some Destination", "Some Asset");
+            auto event = Event(TAG::SEND, (char*)&msg_payload, sizeof(msg_payload));
+            queues.emplace(1, event);
+        }
+    }
+    printf("Queues loaded\n");
+    start = std::chrono::high_resolution_clock::now();
+    handle_sequential();
+    stop = std::chrono::high_resolution_clock::now();
+    printf("Elapsed time = %lu microseconds for sequential\n", std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count());
+    
+    auto msg_payload = Send_Asset("Some Destination", "Some Asset");
+    auto event = Event(TAG::SEND, (char*)&msg_payload, sizeof(msg_payload));
+
+    start = std::chrono::high_resolution_clock::now();
+    Sender()(event);
+    stop = std::chrono::high_resolution_clock::now();
+    printf("Elapsed time = %lu microseconds for single job\n", std::chrono::duration_cast<std::chrono::microseconds>(stop - start).count());
     return 0;
 }
