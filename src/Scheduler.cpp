@@ -7,11 +7,18 @@
 #include <condition_variable>
 #include <memory>
 #include <chrono>
-# include <unistd.h>
+#include <unistd.h>
+#include <sched.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+
 constexpr size_t buffer_size = 125; // Amount of messages stored in dispatcher buffer
 constexpr size_t queue_count = 2; // Amount of queues used
 constexpr size_t core_num = 4; // Amount of cores avaliable for application deployment
 constexpr size_t message_size = 126; // max size of message payload
+constexpr size_t real_core_count = 8; // amount of cores 
+
+static_assert(real_core_count > core_num);
 
 using queue_id = uint16_t;
 
@@ -124,36 +131,23 @@ class Dispatcher
     {
         ((void) Scheduled_Processes.push_back(std::make_unique<T>(std::forward<T>(Processes))), ...);
     }
-    bool is_buffer_full()
-    {
-        if(read_write_dirs_reversed == false)
-        {
-            return  false;
-        }
-        else
-        {
-            return  buffer_write_index == buffer_read_index;
-        }
-    }
-    bool is_buffer_empty()
-    {
-        if(read_write_dirs_reversed == false)
-        {
-            return  buffer_read_index == buffer_write_index;;
-        }
-        else
-        {
-            return  false;
-        } 
-    }
-    void run(uint16_t cpu_id)
+    
+    void set_scheduling_properties(uint16_t cpu_id)
     {
         pthread_t my_thread_native = thread->native_handle();
         cpu_set_t cpuset_1;
         CPU_ZERO(&cpuset_1);
-        CPU_SET(cpu_id, &cpuset_1);
+        CPU_SET(real_core_count - cpu_id - 1, &cpuset_1);
         auto s1 = pthread_setaffinity_np(my_thread_native, sizeof(cpu_set_t), &cpuset_1);
-        if (s1 != 0) printf("Error during setting cpu affinity\n");
+        if (s1 != 0) printf("Error during setting cpu affinity for core %u\n", cpu_id);
+        pid_t tid = syscall(SYS_gettid);
+        sched_param sched_prio;
+        sched_prio.sched_priority = 99;
+        sched_setscheduler(tid, SCHED_FIFO, &sched_prio);
+    }
+    void run(uint16_t cpu_id)
+    {
+        set_scheduling_properties(cpu_id);
         Event saved_msg;
         unsigned int saved_proc_id;
         while(true)
@@ -208,10 +202,6 @@ class Dispatcher
     Event buffered_message;
     bool message_in_buffer{false};
     unsigned int stored_proc_id;
-    std::array<std::pair<Event, unsigned int>, buffer_size> message_buffer{};
-    uint32_t buffer_read_index{0}; 
-    uint32_t buffer_write_index{0};
-    bool read_write_dirs_reversed{false};
     std::condition_variable buffer_sync{};
     std::mutex buffer_guard{};
     std::unique_ptr<std::thread> thread;
@@ -276,7 +266,7 @@ class Getter : public Process
             case TAG::GET:
             {
                 Get_Asset* msg_body = unwrap<Get_Asset>(event);
-                //usleep(10);
+                usleep(10);
                 //printf("Processing Get_Req in Getter\n");
                 break;
             }
@@ -298,7 +288,7 @@ class Sender : public Process
             case TAG::SEND:
             {
                 Send_Asset* msg_body = unwrap<Send_Asset>(event);
-                //usleep(10);
+                usleep(10);
                 //printf("Processing Send_Req in Sender\n");
                 break;
             }
@@ -348,6 +338,13 @@ int main()
     printf("Queues loaded\n");
     Scheduler sch(Getter{}, Sender{});
     std::thread sched_td(&Scheduler::run, std::move(sch));
+    pthread_t my_thread_native = sched_td.native_handle();
+    cpu_set_t cpuset_1;
+    CPU_ZERO(&cpuset_1);
+    CPU_SET(0, &cpuset_1);
+    auto s1 = pthread_setaffinity_np(my_thread_native, sizeof(cpu_set_t), &cpuset_1);
+    if (s1 != 0) printf("Error during setting Scheduler cpu affinity\n");
+
     auto start = std::chrono::high_resolution_clock::now();
     printf("Scheduler started succesfully\n");
     sched_td.join();
